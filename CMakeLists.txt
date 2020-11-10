@@ -38,9 +38,7 @@ set(CMAKE_CXX_STANDARD 11)
 find_package(THREADS)
 
 # lets find the libraries we depend on
-find_library(LIB_COUCHBASE couchbase REQUIRED)
 find_library(LIB_CLIENT client_cxx REQUIRED)
-find_library(LIB_TXN transactions_cxx REQUIRED)
 
 # lets assume we have installed boost, or point to it
 # via -DBOOST_ROOT when calling cmake
@@ -81,7 +79,7 @@ ExternalProject_Add(json
 # now just add the example executable
 add_executable(txn_example txn_example.cxx)
 
-target_link_libraries(txn_example ${CMAKE_THREAD_LIBS_INIT} ${LIB_CLIENT} ${LIB_TXN} ${LIB_COUCHBASE} ${Boost_LIBRARIES} )
+target_link_libraries(txn_example ${CMAKE_THREAD_LIBS_INIT} ${LIB_CLIENT} ${LIB_TXN} ${Boost_LIBRARIES} )
 
 # since these are external, use add_dependencies
 add_dependencies(txn_example spdlog json)
