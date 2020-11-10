@@ -1,76 +1,243 @@
-#include <couchbase/client/bucket.hxx>
+#include <iostream>
+#include <random>
+#include <string>
+#include <chrono>
+
 #include <couchbase/client/cluster.hxx>
 #include <couchbase/transactions.hxx>
-#include <iostream>
-#include <nlohmann/json.hpp>
-#include <spdlog/spdlog.h>
+#include <couchbase/transactions/transaction_config.hxx>
 
+
+using namespace std;
 using namespace couchbase;
 
-struct MyData {
-  std::string a_string;
-  int an_int;
-};
+std::string
+make_uuid()
+{
+    static std::random_device dev;
+    static std::mt19937 rng(dev());
 
-// for conversion to/from MyData when using our api
-void to_json(nlohmann::json &json, const MyData &data) {
-  nlohmann::json j{{"a_string", data.a_string}, {"an_int", data.an_int}};
-  json = j;
+    uniform_int_distribution<int> dist(0, 15);
+
+    const char* v = "0123456789abcdef";
+    const bool dash[] = { 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0 };
+
+    string res;
+    for (int i = 0; i < 16; i++) {
+        if (dash[i])
+            res += "-";
+        res += v[dist(rng)];
+        res += v[dist(rng)];
+    }
+    return res;
 }
 
-// for conversion to/from MyData when using our api
-void from_json(const nlohmann::json &json, MyData &data) {
-  json.at("a_string").get_to(data.a_string);
-  json.at("an_int").get_to(data.an_int);
+const nlohmann::json CONTENT = nlohmann::json::parse("{\"some\":\"content\", \"num\": 0}");
+
+void just_make_connection(const std::string& conn_str)
+{
+    cluster c(conn_str, "Administrator", "password");
 }
 
-int main(int argc, char **argv) {
-  if (argc < 2) {
-    spdlog::info("You need to supply a connection string");
-    return -1;
-  }
+void upsert_random_docs(std::shared_ptr<collection> coll, int n_docs)
+{
+    auto start = std::chrono::steady_clock::now();
+    for (int i=0; i<n_docs; i++) {
+        std::ostringstream stream;
+        stream << "doc_" << i;
+        auto res = coll->upsert(stream.str(), CONTENT);
+        if (!res.is_success()) {
+            cerr << stream.str() << " upsert error" << res.strerror() << endl;
+        }
+    }
+    auto end = std::chrono::steady_clock::now();
+    std::cerr << "===== upsert  ======" << endl;
+    std::chrono::duration<double> elapsed_seconds = end-start;
+    std::cerr << "ops/sec:" << n_docs / elapsed_seconds.count() << endl;
+}
 
-  // defaults, but you can pass in overrides
-  std::string user("Administrator");
-  std::string pass("password");
-  if (argc > 2) {
-    user = argv[2];
-  }
-  if (argc > 3) {
-    pass = argv[3];
-  }
+void read_random_docs(std::shared_ptr<collection> coll, int n_docs)
+{
+    auto start = std::chrono::steady_clock::now();
+    for (int i=0; i<n_docs; i++) {
+        std::ostringstream stream;
+        stream << "doc_" << i;
+        auto res = coll->get(stream.str());
+        if (!res.is_success()) {
+            cerr << stream.str() << " get error: " << res.strerror() << endl;
+        }
+    }
+    auto end = std::chrono::steady_clock::now();
+    std::cerr << "===== get ======" << endl;
+    std::chrono::duration<double> elapsed_seconds = end-start;
+    std::cerr << "ops/sec:" << n_docs / elapsed_seconds.count() << endl;
+}
+void read_write_no_txn(cluster& cluster, std::shared_ptr<collection> coll, int n_docs)
+{
+    auto start = std::chrono::steady_clock::now();
+    int n_errors = 0;
+    std::thread::id this_id = std::this_thread::get_id();
+    for (int i=0; i<n_docs; i++) {
+        try {
+            bool done = false;
+            while(!done) {
+                std::ostringstream stream;
+                stream << "doc_" << i;
+                auto res = coll->get(stream.str());
+                if (res.is_success()) {
+                    auto content = res.value.get();
+                    content["num"] = content["num"].get<int>() + 1;
+                    auto res2 = coll->upsert(stream.str(), content, upsert_options().cas(res.cas));
+                    if (!res.is_success()) {
+                        n_errors++;
+                    } else {
+                        done = true;
+                    }
+                } else {
+                    n_errors++;
+                }
+            }
+        } catch (const std::runtime_error& e) {
+            cerr << this_id << "got error " << e.what() << endl;
+        }
+    }
+    auto end = std::chrono::steady_clock::now();
+    std::cerr << this_id << " ===== read/replace/no_txn ======" << endl;
+    std::chrono::duration<double> elapsed_seconds = end-start;
+    std::cerr << this_id << " ops/sec:" << n_docs / elapsed_seconds.count() << ", " << n_errors << " errors" << endl;
+}
 
-  // Lets connect to a cluster, get a bucket and a collection
-  // (for now, txn only supports default_cluster)
-  std::string connection_string(argv[1]);
-  cluster cluster(connection_string, user, pass);
-  auto bucket = cluster.bucket("default");
-  auto coll = bucket->default_collection();
-  spdlog::info("got collection");
+void read_write_in_txn(cluster& cluster, std::shared_ptr<collection> coll, int n_docs, bool cleanup)
+{
+    auto start = std::chrono::steady_clock::now();
+    transactions::transaction_config config;
+    config.cleanup_client_attempts(cleanup);
+    config.cleanup_lost_attempts(cleanup);
+    transactions::transactions txn(cluster, config);
+    int n_errors = 0;
+    std::thread::id this_id = std::this_thread::get_id();
+    for (int i=0; i<n_docs; i++) {
+        try {
+            txn.run([&](transactions::attempt_context& ctx) {
+                std::ostringstream stream;
+                stream << "doc_" << i;
+                auto doc = ctx.get(coll, stream.str());
+                auto content = doc.content<nlohmann::json>();
+                content["num"] = content["num"].get<int>() + 1;
+                auto doc2 = ctx.replace(coll, doc,  content);
+            });
+        } catch (transactions::transaction_expired& exp) {
+            n_errors++;
+            cerr << this_id << " transaction expired " << exp.what() << endl;
+        } catch (transactions::transaction_failed& fail) {
+            n_errors++;
+            cerr << this_id << " transaction failed " << fail.what() << endl;
+        } catch (std::runtime_error& e) {
+            n_errors++;
+            cerr << this_id << " unexpected error" << e.what() << endl;
+        }
+    }
+    auto end = std::chrono::steady_clock::now();
+    std::cerr << this_id << " ===== read/replace/in_txn ======" << endl;
+    std::chrono::duration<double> elapsed_seconds = end-start;
+    std::cerr << this_id << " ops/sec:" << n_docs / elapsed_seconds.count() << ", " << n_errors << " errors" << endl;
+}
 
-  // Ok lets use the collection to upsert a bit of data
-  MyData something{"foo", 3};
-  auto result = coll->upsert("imarandomkey", something);
-  spdlog::info("got result: {}", result);
+const int NUM_DOCS = 100000;
+const int NUM_THREADS = 10;
+// repeat it so we don't do the dns srv lookup automatically - till
+// lcb changes that this makes connect faster.
+const std::string CONN_STR = "couchbase://127.0.0.1,127.0.0.1";
 
-  // Now, we need a transactions object...
-  transactions::transaction_config config;
-  transactions::transactions txns(cluster, config);
+int main(int argc, char* argv[])
+{
+    auto conn_str = CONN_STR;
+    if (argc > 1) {
+        std::string ip = argv[1];
+        conn_str = std::string("couchbase://") + ip + std::string(",") + ip;
+    }
+    auto n_docs = NUM_DOCS;
+    if (argc > 2) {
+        std::stringstream str(argv[2]);
+        str >> n_docs;
+    }
+    auto n_threads = NUM_THREADS;
+    if (argc > 3) {
+        std::stringstream str(argv[3]);
+        str >> n_threads;
+    }
+    bool cleanup = false;
+    if (argc > 4) {
+        cleanup = true;
+    }
+    cerr << "using " << conn_str << " as connection string" << endl;
+    cerr << "using " << n_docs << " documents" << endl;
+    cerr << "using " << n_threads << " threads" << endl;
+    cerr << "setting cleanup (both kinds) to " << cleanup << endl;
+    std::vector<std::thread> threads;
+    // first, upsert them in a single thread
+    cluster c(conn_str, "Administrator", "password");
+    auto collection = c.bucket("default")->default_collection();
+    upsert_random_docs(collection, n_docs);
+    // just make connection
+    for(int j=0; j<20; j++) {
+        cerr << "making " << n_threads << "connections in their own thread " << j << " of 20" << endl;
+        for (int i=0; i<n_threads; i++) {
+            threads.push_back(std::move(std::thread([conn_str]() {
+                try {
+                    cluster c(conn_str, "Administrator", "password");
 
-  // Finally, lets do a very simple transaction
-  txns.run([&](transactions::attempt_context &ctx) {
-    // The result is a transaction_document, which contains the content, and
-    // the metadata (like the CAS)
-    auto result = ctx.get(coll, "imarandomkey");
-    MyData data = result.content<MyData>();
-    data.an_int *= 2;
-    // since we give the replace the transaction document, if someone changes
-    // it after we read and before we write (only can happen outside a txn),
-    // then it will rollback and retry
-    auto replace_result = ctx.replace(coll, result, data);
-    // result's ostream operator<< should work like this:
-    // spdlog::info("replace result: {}", replace_result);
-    // but doesn't, so
-    spdlog::info("new CAS for doc: {}", replace_result);
-  });
+                } catch(const std::runtime_error& e) {
+                    cerr << "ERROR " << e.what() << endl;
+                }
+            })));
+        }
+        cerr << "all " << n_threads << " threads started" << endl;
+        for (auto&& t : threads) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        cerr << "all " << n_threads << " threads stopped" << endl;
+    }
+    // now, read/write without a txn
+    for (int i=0; i<n_threads; i++) {
+        threads.emplace_back([n_docs, conn_str]() {
+            try {
+                cluster c(conn_str, "Administrator", "password");
+                auto coll = c.bucket("default")->default_collection();
+                read_write_no_txn(c, coll, n_docs);
+            } catch (const std::runtime_error& e) {
+                cerr << "ERROR " << e.what() << endl;
+            }
+        });
+    }
+    cerr << "all " << n_threads << " threads started" << endl;
+    for (auto&& t : threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    cerr << "all " << n_threads << " threads stopped" << endl;
+    threads.clear();
+
+    // now read/write with txn
+    for (int i=0; i<n_threads; i++) {
+        threads.emplace_back(std::thread([n_docs, conn_str, cleanup]() {
+            try {
+                cluster c(conn_str, "Administrator", "password");
+                auto coll = c.bucket("default")->default_collection();
+                read_write_in_txn(c, coll, n_docs, cleanup);
+            } catch (const std::runtime_error& e) {
+                cerr << "ERROR " << e.what() << endl;
+            }
+        }));
+    }
+    cerr << "all " << n_threads << " threads started" << endl;
+    for (auto&& t : threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    cerr << "all " << n_threads << " threads stopped" << endl;
 }
