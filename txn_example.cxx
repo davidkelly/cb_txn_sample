@@ -132,9 +132,6 @@ void read_write_in_txn(cluster& cluster, std::shared_ptr<collection> coll, int n
         } catch (transactions::transaction_failed& fail) {
             n_errors++;
             cerr << this_id << " transaction failed " << fail.what() << endl;
-        } catch (transactions::transaction_commit_ambiguous& amb) {
-            n_errors++;
-            cerr << this_id << " transaction commit ambiguous " << amb.what() << endl;
         } catch (std::runtime_error& e) {
             n_errors++;
             cerr << this_id << " unexpected error" << e.what() << endl;
